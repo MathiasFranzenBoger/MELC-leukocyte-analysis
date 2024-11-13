@@ -1,0 +1,2468 @@
+---
+title: "scRNA analysis of melc data"
+author: "Mathias Franzén"
+date: "2024-05-23"
+output: html_document
+editor_options: 
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+#### Load data and clustering ####
+setwd("")
+
+library(Seurat)
+library(tidyseurat)
+library(data.table)
+library(dplyr)
+library(ggplot2)
+library(Rtsne)
+library(uwot)
+library(doParallel)
+library(missForest)
+library(missRanger)
+library(readr)
+library(SeuratObject)
+library(patchwork)
+library(lubridate)
+library(pheatmap)
+library(harmony)
+library(MAST)
+library(openxlsx)
+library(ComplexHeatmap)
+library(circlize)
+library(readxl)
+library(reshape2)
+library(tidyr)
+library(Seurat)
+library(tidyr)
+library(dplyr)
+library(ggplot2)
+library(rstatix)
+
+
+# Load the CSV file without row names
+data <- read.csv("")
+
+# Remove prefix from column names containing intensity values
+intensity_cols <- grep("^Intensity_MeanIntensity_R_", colnames(data))
+colnames(data)[intensity_cols] <- gsub("^Intensity_MeanIntensity_R_", "", colnames(data)[intensity_cols])
+
+# Remove specified columns
+data <- data[, !(colnames(data) %in% c("ObjectNumber", "Metadata_Field", "Metadata_Frame", "Metadata_Marker", "Metadata_Series"))]
+
+# Set ImageNumber column to be sequential
+data$ImageNumber <- seq_len(nrow(data))
+
+# Inspect the modified data to ensure it is loaded correctly
+head(data)
+
+# Check for duplicates in the first column (Cell Identifiers)
+duplicated_rows <- duplicated(data[, 1])
+if (any(duplicated_rows)) {
+  print("There are duplicate cell identifiers. They will be made unique.")
+  print(data[duplicated_rows, 1])
+  # Make cell identifiers unique by appending an index
+  data[, 1] <- make.unique(as.character(data[, 1]))
+}
+
+rownames(data) <- data[, 1]
+data <- data[, -1]
+
+metadata_columns <- 1:2
+metadata <- data[, metadata_columns]
+expression_data <- data[, -metadata_columns]
+
+print(head(expression_data))
+
+seurat_object <- CreateSeuratObject(counts = t(expression_data))
+
+# Add metadata to Seurat object
+for (colname in colnames(metadata)) {
+  seurat_object[[colname]] <- metadata[[colname]]
+}
+
+# Normalize the data
+seurat_object <- NormalizeData(seurat_object)
+
+# Find variable features
+seurat_object <- FindVariableFeatures(seurat_object)
+
+# Scale the data
+seurat_object <- ScaleData(seurat_object)
+
+# Perform PCA
+seurat_object <- RunPCA(seurat_object)
+
+# Perform Harmony integration
+seurat_object <- harmony::RunHarmony(
+  object = seurat_object,
+  assay = "RNA", # specify the assay to use
+  group.by = "Metadata_ID", # specify metadata variables
+  theta = 3 # specify the harmony parameter
+)
+
+# Perform UMAP with Harmony reduction
+seurat_object <- RunUMAP(seurat_object, reduction = "harmony", dims = 1:15) #15
+
+# Find neighbors and clusters
+seurat_object <- FindNeighbors(seurat_object, reduction = "harmony")
+seurat_object <- FindClusters(seurat_object, resolution = 0.15) #0.15
+
+# Visualize UMAP with Harmony integration
+DimPlot(seurat_object, reduction = "umap", label = TRUE) + ggtitle("Leukocytes")
+DoHeatmap(seurat_object)
+FeaturePlot(seurat_object, features = c("CD3", "CD4", "CD8", "CD69"))
+DimPlot(seurat_object, reduction = "umap", label = TRUE, group.by = "Metadata_ID")
+seurat_ctr <- subset(seurat_object, subset = Metadata_Condition == "CTR")
+DimPlot(seurat_ctr, reduction = "umap", label = TRUE) + ggtitle("CTR Cells in Each Cluster")
+seurat_hiv <- subset(seurat_object, subset = Metadata_Condition == "HIV")
+DimPlot(seurat_hiv, reduction = "umap", label = TRUE) + ggtitle("HIV Cells in Each Cluster")
+
+# Visualize UMAP for condition
+DimPlot(seurat_object, reduction = "umap", group.by = "Metadata_Condition") + ggtitle("UMAP by Condition")
+
+# Define your features
+features <- c("CD3", "CD8", "CD4", "CD69")
+
+# Access the RNA assay data
+rna_data <- GetAssayData(seurat_object, assay = "RNA", slot = "data")
+
+# Generate the FeaturePlot for each feature with the custom color scale
+plots <- lapply(features, function(feature) {
+  p <- FeaturePlot(seurat_object, features = feature) +
+    scale_color_gradientn(colors = c("navy", "blue", "red", "orange"), name = "Expression", 
+                          breaks = c(min(rna_data[feature, ]), 
+                                     max(rna_data[feature, ])), 
+                          labels = c("Low", "High")) +
+    labs(title = paste("Feature:", feature)) +
+    theme_minimal() +
+    theme(panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          panel.background = element_blank(),
+          axis.line.x = element_line(color = "black"),
+          axis.line.y = element_line(color = "black"))
+  return(p)
+})
+
+# Combine the plots into one
+combined_plot <- wrap_plots(plots, ncol = 2)
+
+# Print the combined plot
+print(combined_plot)
+
+# Define the file path for the PDF
+output_pdf <- "feature_plots_Leukocytes.pdf"
+
+# Save the combined plot as a PDF
+ggsave(output_pdf, combined_plot, device = "pdf", width = 12, height = 8)
+
+# Print a message indicating the file has been saved
+print(paste("Feature plots saved as", output_pdf))
+
+
+# Save the Seurat object for future use
+saveRDS(seurat_object, file = "seurat_object.rds")
+
+
+
+
+```
+
+
+```{r pressure, echo=FALSE}
+# Subset Seurat object for HIV and CTR conditions
+seurat_hiv <- subset(seurat_object, subset = Metadata_Condition == "HIV")
+seurat_ctr <- subset(seurat_object, subset = Metadata_Condition == "CTR")
+
+# Calculate the percentage of cells in each cluster for each individual
+calculate_cluster_percentage <- function(seurat_object) {
+  cell_counts <- table(Idents(seurat_object), seurat_object$Metadata_ID)
+  total_counts <- colSums(cell_counts)
+  cluster_percentages <- sweep(cell_counts, 2, total_counts, FUN = "/") * 100
+  cluster_percentages <- as.data.frame(as.table(cluster_percentages))
+  colnames(cluster_percentages) <- c("Cluster", "Individual", "Percentage")
+  return(cluster_percentages)
+}
+
+hiv_cluster_percentages <- calculate_cluster_percentage(seurat_hiv)
+ctr_cluster_percentages <- calculate_cluster_percentage(seurat_ctr)
+
+# Combine the results into one data frame and add the condition label
+hiv_cluster_percentages$Condition <- "HIV"
+ctr_cluster_percentages$Condition <- "CTR"
+combined_percentages <- rbind(hiv_cluster_percentages, ctr_cluster_percentages)
+
+# Verify the consistency in the combined percentages
+cat("Combined Cluster Percentages:\n")
+print(combined_percentages)
+print(table(combined_percentages$Cluster, combined_percentages$Condition))
+
+# Perform Mann-Whitney U test for each cluster
+mann_whitney_results <- combined_percentages %>%
+  group_by(Cluster) %>%
+  wilcox_test(Percentage ~ Condition)
+
+# Print and save the results
+print(mann_whitney_results)
+write.xlsx(mann_whitney_results, file = "Percent_Individual.xlsx")
+
+# Calculate the percentage of cells in each cluster for HIV and CTR for plotting
+calculate_total_percentages <- function(seurat_obj) {
+  cluster_counts <- table(Idents(seurat_obj))
+  total_counts <- sum(cluster_counts)
+  cluster_percentages <- (cluster_counts / total_counts) * 100
+  return(cluster_percentages)
+}
+
+hiv_total_percentages <- calculate_total_percentages(seurat_hiv)
+ctr_total_percentages <- calculate_total_percentages(seurat_ctr)
+
+# Combine the total percentages for plotting
+plot_percentages <- data.frame(
+  Cluster = names(hiv_total_percentages),
+  HIV_Percentage = as.numeric(hiv_total_percentages),
+  CTR_Percentage = as.numeric(ctr_total_percentages)
+)
+
+# Reshape the data for plotting
+plot_percentages_long <- gather(plot_percentages, Condition, Percentage, -Cluster)
+
+# Define custom colors (replace with the actual colors from DimPlot if known)
+dimplot_colors <- scales::hue_pal()(length(unique(plot_percentages_long$Cluster)))
+
+# Merge significant markers into plot data (assuming significant_markers is defined elsewhere in your script)
+plot_data_with_significance <- plot_percentages_long
+
+# Calculate the middle position of each cluster
+cluster_middle <- plot_percentages_long %>%
+  group_by(Cluster) %>%
+  summarize(Middle_Position = mean(Percentage))
+
+# Merge the middle positions and condition into the significant markers data
+significant_markers_with_middle <- merge(significant_markers, cluster_middle, by = "Cluster")
+significant_markers_with_middle <- merge(significant_markers_with_middle, plot_percentages_long[, c("Cluster", "Condition")], by = "Cluster")
+
+# Create the stacked bar plot with significant markers
+p <- ggplot(plot_data_with_significance, aes(x = Condition, y = Percentage, fill = Cluster)) +
+  geom_bar(stat = "identity", position = "stack") +
+  labs(title = "Percentage of Cells in Each Cluster by Condition",
+       x = "Condition",
+       y = "Percentage of Cells") +
+  scale_fill_manual(values = dimplot_colors) +
+  theme_minimal() +
+  theme(
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.background = element_blank(),
+    axis.line = element_line(colour = "black")
+  )
+
+# Save the plot as a PDF
+ggsave("Percent_clusters.pdf", p)
+
+
+```
+
+
+```{r pressure, echo=FALSE}
+
+### Generate stack plot for count of cells ###
+
+# Subset Seurat object for HIV and CTR conditions
+seurat_hiv <- subset(seurat_object, subset = Metadata_Condition == "HIV")
+seurat_ctr <- subset(seurat_object, subset = Metadata_Condition == "CTR")
+
+# If remove DMPA
+# seurat_hiv <- subset(seurat_object, subset = Metadata_Condition == "HIV" & Metadata_ID != "")
+
+# Calculate the total counts of cells in each cluster for each individual
+
+calculate_cluster_counts <- function(seurat_object) {
+  # Get the cell count table with clusters as rows and individuals as columns
+  cell_counts <- table(Idents(seurat_object), seurat_object$Metadata_ID)
+  
+  # Create the correct data frame
+  cluster_counts <- data.frame(
+    Cluster = rep(rownames(cell_counts), times = ncol(cell_counts)),   # Repeat each cluster for all individuals
+    Individual = rep(colnames(cell_counts), each = nrow(cell_counts)), # Repeat individuals for each cluster
+    Count = as.vector(cell_counts)                                     # Flatten the matrix to a vector
+  )
+  
+  return(cluster_counts)
+}
+
+hiv_cluster_counts <- calculate_cluster_counts(seurat_hiv)
+ctr_cluster_counts <- calculate_cluster_counts(seurat_ctr)
+
+
+# Combine the results into one data frame and add the condition label
+hiv_cluster_counts$Condition <- "HIV"
+ctr_cluster_counts$Condition <- "CTR"
+combined_counts <- rbind(hiv_cluster_counts, ctr_cluster_counts)
+
+# Verify the consistency in the combined counts
+cat("Combined Cluster Counts:\n")
+print(combined_counts)
+print(table(combined_counts$Cluster, combined_counts$Condition))
+
+# Perform Mann-Whitney U test for each cluster
+mann_whitney_results_counts <- combined_counts %>%
+  group_by(Cluster) %>%
+  wilcox_test(Count ~ Condition)
+
+# Print and save the results
+print(mann_whitney_results_counts)
+write.xlsx(mann_whitney_results_counts, file = "Count_Individual.xlsx")
+
+# Calculate the total counts of cells in each cluster for HIV and CTR for plotting
+calculate_total_counts <- function(seurat_obj) {
+  cluster_counts <- table(Idents(seurat_obj))
+  return(cluster_counts)
+}
+
+hiv_total_counts <- calculate_total_counts(seurat_hiv)
+ctr_total_counts <- calculate_total_counts(seurat_ctr)
+
+# Combine the total counts for plotting
+plot_counts <- data.frame(
+  Cluster = names(hiv_total_counts),
+  HIV_Count = as.numeric(hiv_total_counts),
+  CTR_Count = as.numeric(ctr_total_counts)
+)
+
+# Reshape the data for plotting
+plot_counts_long <- gather(plot_counts, Condition, Count, -Cluster)
+
+# Define custom colors (replace with the actual colors from DimPlot if known)
+dimplot_colors_counts <- scales::hue_pal()(length(unique(plot_counts_long$Cluster)))
+
+# Create the stacked bar plot for counts
+p_counts <- ggplot(plot_counts_long, aes(x = Condition, y = Count, fill = Cluster)) +
+  geom_bar(stat = "identity", position = "stack") +
+  labs(title = "Count of Cells in Each Cluster by Condition",
+       x = "Condition",
+       y = "Count of Cells") +
+  scale_fill_manual(values = dimplot_colors_counts) +
+  theme_minimal() +
+  theme(
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.background = element_blank(),
+    axis.line = element_line(colour = "black")
+  )
+
+# Save the plot as a PDF
+ggsave("Count_clusters.pdf", p_counts)
+
+
+```
+
+
+
+```{r pressure, echo=FALSE}
+# Get the cluster labels from the Seurat object
+cluster_labels <- levels(Idents(seurat_object))
+
+cluster_mean_expression <- AggregateExpression(object = seurat_object, by = "RNA_snn_res.0.15")
+
+# Update the cluster names in cluster_mean_expression
+colnames(cluster_mean_expression$RNA) <- cluster_labels
+
+# Convert cluster_mean_expression to a matrix
+cluster_mean_matrix <- as.matrix(cluster_mean_expression$RNA)
+
+# Reorder columns of cluster_mean_matrix based on cluster_order
+cluster_mean_matrix <- cluster_mean_matrix[, match(cluster_order, colnames(cluster_mean_matrix))]
+
+# Define the color gradient
+color_gradient <- colorRampPalette(c("blue", "white", "red"))(100)
+
+# Optionally log-transform the data (adding a small constant to avoid log(0))
+log_cluster_mean_matrix <- log2(cluster_mean_matrix + 1)
+
+# Generate the heatmap with the log-transformed data
+p <- pheatmap(log_cluster_mean_matrix,
+         color = color_gradient,
+         cluster_rows = TRUE,       # Hierarchical clustering of rows (genes)
+         cluster_cols = FALSE,      # Do not cluster columns (clusters)
+         display_numbers = FALSE,   # Hide numbers on tiles
+         fontsize_row = 8,          # Font size for row labels
+         fontsize_col = 8,          # Font size for column labels
+         legend = TRUE,             # Show legend
+         main = "Heatmap of Log-Transformed Mean Expression Levels by Cluster"
+)
+
+# Save the heatmap as a PDF file
+pdf("heatmap_logIntens_leukocytes.pdf", width = 8, height = 6)
+print(p)
+dev.off()
+
+# Optionally, you can scale the rows to enhance contrast for each gene
+p <- pheatmap(cluster_mean_matrix,
+         color = color_gradient,
+         cluster_rows = TRUE,
+         cluster_cols = FALSE,      # Do not cluster columns (clusters)
+         scale = "row",             # Scale rows
+         display_numbers = FALSE,
+         fontsize_row = 8,
+         fontsize_col = 8,
+         legend = TRUE,
+         main = "Heatmap of Scaled Mean Expression Levels by Cluster"
+)
+
+pdf("heatmap_scaled_markers_leukocytes.pdf", width = 8, height = 6)
+print(p)
+dev.off()
+
+```
+
+
+
+```{r pressure, echo=FALSE}
+### Dot plot ###
+
+# Define the markers you want to plot
+selected_markers <- c("CD3", "CD8", "CD69", "CD103", "GRZa", "GRZb", "Eomes", "CD4", "CD161", "HLADR", "Langerin", "TCRVa72", "CD66b", "CD49a", "CD31", "ECadherin")
+
+# Create the dot plot with custom size scale
+dot_plot <- DotPlot(seurat_object, features = selected_markers) + 
+  scale_size_continuous(range = c(4, 10)) +  # Adjust the size range
+  scale_color_gradientn(colors = c("blue", "white", "red")) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+# Add the legend for "Percent Expressed"
+dot_plot <- dot_plot + guides(size = guide_legend(title = "Percent Expressed"))
+
+# Display the dot plot
+print(dot_plot)
+
+# Save the dot plot as a PDF file
+ggsave("dotplot_leukocytes.pdf", plot = dot_plot, width = 8, height = 6)
+
+```
+
+
+
+```{r pressure, echo=FALSE}
+# Differential expression analysis between HIV and CTR within each cluster
+Idents(seurat_object) <- "seurat_clusters"
+
+# Ensure Metadata_Condition is present in the Seurat object
+if ("Metadata_Condition" %in% colnames(seurat_object[[]])) {
+  all_clusters <- unique(Idents(seurat_object))
+  cluster_de_genes <- list()
+
+  for (cluster in all_clusters) {
+    print(paste("Processing cluster:", cluster))
+    cluster_cells <- WhichCells(seurat_object, idents = cluster)
+    
+    hiv_cells <- intersect(cluster_cells, WhichCells(seurat_object, expression = Metadata_Condition == "HIV"))
+    ctr_cells <- intersect(cluster_cells, WhichCells(seurat_object, expression = Metadata_Condition == "CTR"))
+    
+    print(paste("Number of HIV cells in cluster", cluster, ":", length(hiv_cells)))
+    print(paste("Number of CTR cells in cluster", cluster, ":", length(ctr_cells)))
+    
+    if (length(hiv_cells) > 3 & length(ctr_cells) > 3) {  # Ensure sufficient cells in both groups
+      de_genes <- FindMarkers(seurat_object, ident.1 = hiv_cells, ident.2 = ctr_cells, test.use = "MAST", min.pct = 0, logfc.threshold = 0)
+      cluster_de_genes[[as.character(cluster)]] <- de_genes
+    } else {
+      print(paste("Skipping cluster", cluster, "due to insufficient cells in one of the groups"))
+    }
+  }
+
+  # Create a new workbook
+  wb <- createWorkbook()
+
+  # Add a sheet and write data for each cluster
+  for (cluster in names(cluster_de_genes)) {
+    addWorksheet(wb, paste0("Cluster_", cluster))
+    writeData(wb, sheet = paste0("Cluster_", cluster), cluster_de_genes[[cluster]], rowNames = TRUE)
+  }
+
+  # Save the workbook to a file
+  saveWorkbook(wb, "DEGs_clusters.xlsx", overwrite = TRUE)
+
+  print("Differential expression results saved to DEGs_clusters.xlsx")
+} else {
+  print("Metadata_Condition is not found in the Seurat object.")
+}
+
+
+###########
+
+
+# Define the file path
+file_path <- "DEGs_clusters.xlsx"
+
+# Ensure the file exists
+if (!file.exists(file_path)) {
+  stop("File not found: ", file_path)
+}
+
+# Load the workbook
+wb <- loadWorkbook(file_path)
+
+# Get sheet names (clusters)
+sheets <- names(wb)
+
+# Check if sheets were found
+if (length(sheets) == 0) {
+  stop("No sheets found in the workbook.")
+}
+
+# Read each sheet into a list
+de_genes_list <- lapply(sheets, function(sheet) {
+  read.xlsx(wb, sheet = sheet, rowNames = TRUE)
+})
+
+# Combine all data into one dataframe, adding cluster information
+all_de_genes <- bind_rows(
+  lapply(seq_along(de_genes_list), function(i) {
+    cluster <- sheets[i]
+    de_genes_list[[i]] %>% 
+      mutate(Cluster = cluster, Gene = rownames(.)) %>%
+      select(Gene, avg_log2FC, Cluster)
+  })
+)
+
+# Define a color scale
+breaks <- seq(-2, 2, by = 0.1)
+colors <- colorRampPalette(c("blue", "white", "red"))(length(breaks))
+
+# Prepare the matrix for heatmap
+heatmap_data <- spread(all_de_genes, key = Cluster, value = avg_log2FC)
+
+# Remove genes with no values across all clusters
+heatmap_data <- heatmap_data[rowSums(is.na(heatmap_data)) < ncol(heatmap_data), ]
+
+# Convert to matrix and set row names as gene names
+heatmap_matrix <- as.matrix(heatmap_data[,-1]) # Assuming first column is Gene
+rownames(heatmap_matrix) <- heatmap_data$Gene
+
+p <- pheatmap(
+  heatmap_matrix,
+  cluster_cols = TRUE,
+  cluster_rows = TRUE,
+  color = colors,
+  breaks = breaks,
+  show_colnames = TRUE,
+  show_rownames = TRUE,
+  main = "" # Remove the default title
+)
+
+# Define output file name
+output_pdf <- "./heatmap.pdf"
+
+# Save the heatmap as a PDF
+pdf(output_pdf)
+p
+dev.off()
+
+
+print(paste("Heatmap saved as", output_pdf))
+
+```
+
+
+
+```{r pressure, echo=FALSE}
+
+### Subcluster CD8 T cells###
+
+# Subset the Seurat object to include only cells from cluster 0
+cluster_0_cells <- subset(seurat_object, idents = 0)
+
+# Normalize the subset data
+cluster_0_cells <- NormalizeData(cluster_0_cells)
+
+# Find variable features
+# cluster_0_cells <- FindVariableFeatures(cluster_0_cells)
+
+VariableFeatures(cluster_0_cells) <- c("CD69", "CD103", "Eomes", "GRZa", "GRZb", "HLADR", "CD45")
+
+# Scale the data
+cluster_0_cells <- ScaleData(cluster_0_cells)
+
+# Perform PCA
+cluster_0_cells <- RunPCA(cluster_0_cells)
+
+# Perform Harmony integration if necessary
+cluster_0_cells <- harmony::RunHarmony(
+  object = cluster_0_cells,
+  assay = "RNA",
+  group.by = "Metadata_ID",
+  theta = 3
+)
+
+# Perform UMAP with Harmony reduction
+cluster_0_cells <- RunUMAP(cluster_0_cells, reduction = "harmony", dims = 1:6)
+
+# Find neighbors and clusters within cluster 0 cells
+cluster_0_cells <- FindNeighbors(cluster_0_cells, reduction = "harmony", dims = 1:6)
+cluster_0_cells <- FindClusters(cluster_0_cells, resolution = 0.15)  # You can adjust the resolution parameter
+
+# Visualize the subclusters
+DimPlot(cluster_0_cells, reduction = "umap", label = TRUE) + ggtitle("CD8 T cells")
+DoHeatmap(cluster_0_cells)
+cluster_0_cells_ctr <- subset(cluster_0_cells, subset = Metadata_Condition == "CTR")
+DimPlot(cluster_0_cells_ctr, reduction = "umap", label = TRUE) + ggtitle("CTR Cells in Each Cluster")
+cluster_0_cellst_hiv <- subset(cluster_0_cells, subset = Metadata_Condition == "HIV")
+DimPlot(cluster_0_cellst_hiv, reduction = "umap", label = TRUE) + ggtitle("HIV Cells in Each Cluster")
+
+
+```
+
+
+```{r pressure, echo=FALSE}
+### Generate stack plot for percentage of cells ###
+
+# Subset Seurat object for HIV and CTR conditions
+seurat_hiv <- subset(cluster_0_cells, subset = Metadata_Condition == "HIV")
+seurat_ctr <- subset(cluster_0_cells, subset = Metadata_Condition == "CTR")
+
+# Calculate the percentage of cells in each cluster for each individual
+calculate_cluster_percentage <- function(cluster_0_cells) {
+  cell_counts <- table(Idents(cluster_0_cells), cluster_0_cells$Metadata_ID)
+  total_counts <- colSums(cell_counts)
+  cluster_percentages <- sweep(cell_counts, 2, total_counts, FUN = "/") * 100
+  
+  # Convert the table to a data frame with proper row and column names
+  cluster_percentages <- as.data.frame(as.table(cluster_percentages))
+  colnames(cluster_percentages) <- c("Cluster", "Individual", "Percentage")
+  
+  return(cluster_percentages)
+}
+
+hiv_cluster_percentages <- calculate_cluster_percentage(seurat_hiv)
+ctr_cluster_percentages <- calculate_cluster_percentage(seurat_ctr)
+
+# Combine the results into one data frame and add the condition label
+hiv_cluster_percentages$Condition <- "HIV"
+ctr_cluster_percentages$Condition <- "CTR"
+combined_percentages <- rbind(hiv_cluster_percentages, ctr_cluster_percentages)
+
+# Verify the consistency in the combined percentages
+cat("Combined Cluster Percentages:\n")
+print(combined_percentages)
+print(table(combined_percentages$Cluster, combined_percentages$Condition))
+
+# Perform Mann-Whitney U test for each cluster
+mann_whitney_results <- combined_percentages %>%
+  group_by(Cluster) %>%
+  wilcox_test(Percentage ~ Condition)
+
+# Print and save the results
+print(mann_whitney_results)
+write.xlsx(mann_whitney_results, file = "CD8_Tcells_Percent_Individual.xlsx")
+
+# Calculate the percentage of cells in each cluster for HIV and CTR for plotting
+calculate_total_percentages <- function(cluster_0_cells) {
+  cluster_counts <- table(Idents(cluster_0_cells))
+  total_counts <- sum(cluster_counts)
+  cluster_percentages <- (cluster_counts / total_counts) * 100
+  return(cluster_percentages)
+}
+
+hiv_total_percentages <- calculate_total_percentages(seurat_hiv)
+ctr_total_percentages <- calculate_total_percentages(seurat_ctr)
+
+# Combine the total percentages for plotting
+plot_percentages <- data.frame(
+  Cluster = names(hiv_total_percentages),
+  HIV_Percentage = as.numeric(hiv_total_percentages),
+  CTR_Percentage = as.numeric(ctr_total_percentages)
+)
+
+# Reshape the data for plotting
+plot_percentages_long <- gather(plot_percentages, Condition, Percentage, -Cluster)
+
+# Define custom colors (replace with the actual colors from DimPlot if known)
+dimplot_colors <- scales::hue_pal()(length(unique(plot_percentages_long$Cluster)))
+
+# Create the stacked bar plot
+p <- ggplot(plot_percentages_long, aes(x = Condition, y = Percentage, fill = Cluster)) +
+  geom_bar(stat = "identity", position = "stack") +
+  labs(title = "Percentage of Cells in Each Cluster by Condition",
+       x = "Condition",
+       y = "Percentage of Cells") +
+  scale_fill_manual(values = dimplot_colors) +
+  theme_minimal() +
+  theme(
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.background = element_blank(),
+    axis.line = element_line(colour = "black")
+  )
+
+p
+
+# Save the plot as a PDF
+ggsave("CD8_Tcells_Percent_clusters.pdf", p)
+
+
+```
+
+
+```{r pressure, echo=FALSE}
+### Generate stack plot for count of cells ###
+
+# Subset Seurat object for HIV and CTR conditions
+seurat_hiv <- subset(cluster_0_cells, subset = Metadata_Condition == "HIV")
+seurat_ctr <- subset(cluster_0_cells, subset = Metadata_Condition == "CTR")
+
+
+# Function to calculate cluster counts for each individual
+calculate_cluster_counts <- function(cluster_0_cells) {
+  cell_counts <- table(Idents(cluster_0_cells), cluster_0_cells$Metadata_ID)
+  
+  # Convert the table to a data frame with proper row and column names
+  cluster_counts <- as.data.frame(cell_counts)
+  colnames(cluster_counts) <- c("Cluster", "Individual", "Count")
+  
+  return(cluster_counts)
+}
+
+# Calculate cluster counts for HIV and CTR
+hiv_cluster_counts <- calculate_cluster_counts(seurat_hiv)
+ctr_cluster_counts <- calculate_cluster_counts(seurat_ctr)
+
+# Combine counts and add condition label
+hiv_cluster_counts$Condition <- "HIV"
+ctr_cluster_counts$Condition <- "CTR"
+combined_counts <- rbind(hiv_cluster_counts, ctr_cluster_counts)
+
+# Print combined counts for verification
+cat("Combined Cluster Counts:\n")
+print(combined_counts)
+
+# Verify the consistency in the combined counts
+print(table(combined_counts$Cluster, combined_counts$Condition))
+
+# Perform Mann-Whitney U test for each cluster
+mann_whitney_results_counts <- combined_counts %>%
+  group_by(Cluster) %>%
+  wilcox_test(Count ~ Condition)
+
+# Print and save the results
+print(mann_whitney_results_counts)
+write.xlsx(mann_whitney_results_counts, file = "CD8_Tcells_Count_Individual.xlsx")
+
+# Calculate the total counts of cells in each cluster for plotting
+calculate_total_counts <- function(seurat_obj) {
+  cluster_counts <- table(Idents(seurat_obj))
+  return(cluster_counts)
+}
+
+hiv_total_counts <- calculate_total_counts(seurat_hiv)
+ctr_total_counts <- calculate_total_counts(seurat_ctr)
+
+# Combine the total counts for plotting
+plot_counts <- data.frame(
+  Cluster = names(hiv_total_counts),
+  HIV_Count = as.numeric(hiv_total_counts),
+  CTR_Count = as.numeric(ctr_total_counts)
+)
+
+# Reshape the data for plotting
+plot_counts_long <- gather(plot_counts, Condition, Count, -Cluster)
+
+# Define custom colors (replace with the actual colors from DimPlot if known)
+dimplot_colors_counts <- scales::hue_pal()(length(unique(plot_counts_long$Cluster)))
+
+# Create the stacked bar plot for counts
+p_counts <- ggplot(plot_counts_long, aes(x = Condition, y = Count, fill = Cluster)) +
+  geom_bar(stat = "identity", position = "stack") +
+  labs(title = "Count of Cells in Each Cluster by Condition",
+       x = "Condition",
+       y = "Count of Cells") +
+  scale_fill_manual(values = dimplot_colors_counts) +
+  theme_minimal() +
+  theme(
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.background = element_blank(),
+    axis.line = element_line(colour = "black")
+  )
+
+# Save the plot as a PDF
+ggsave("CD8_Tcells_Count_clusters.pdf", p_counts)
+
+```
+
+
+```{r pressure, echo=FALSE}
+# Get the cluster labels from the Seurat object
+cluster_labels <- levels(Idents(cluster_0_cells))
+
+cluster_mean_expression <- AggregateExpression(object = cluster_0_cells, by = "RNA_snn_res.0.15")
+
+# Update the cluster names in cluster_mean_expression
+colnames(cluster_mean_expression$RNA) <- cluster_labels
+
+# Convert cluster_mean_expression to a matrix
+cluster_mean_matrix <- as.matrix(cluster_mean_expression$RNA)
+
+# Reorder columns of cluster_mean_matrix based on cluster_order
+cluster_mean_matrix <- cluster_mean_matrix[, match(cluster_order, colnames(cluster_mean_matrix))]
+
+# Define the color gradient
+color_gradient <- colorRampPalette(c("blue", "white", "red"))(100)
+
+# Optionally log-transform the data (adding a small constant to avoid log(0))
+log_cluster_mean_matrix <- log2(cluster_mean_matrix + 1)
+
+# Generate the heatmap with the log-transformed data
+p <- pheatmap(log_cluster_mean_matrix,
+         color = color_gradient,
+         cluster_rows = TRUE,       # Hierarchical clustering of rows (genes)
+         cluster_cols = FALSE,      # Do not cluster columns (clusters)
+         display_numbers = FALSE,   # Hide numbers on tiles
+         fontsize_row = 8,          # Font size for row labels
+         fontsize_col = 8,          # Font size for column labels
+         legend = TRUE,             # Show legend
+         main = "Heatmap of Log-Transformed Mean Expression Levels by Cluster"
+)
+
+p
+
+# Save the heatmap as a PDF file
+pdf("heatmap_logIntens_CD8 Tcells.pdf", width = 8, height = 6)
+print(p)
+dev.off()
+
+# Optionally, you can scale the rows to enhance contrast for each gene
+p <- pheatmap(cluster_mean_matrix,
+         color = color_gradient,
+         cluster_rows = TRUE,
+         cluster_cols = FALSE,      # Do not cluster columns (clusters)
+         scale = "row",             # Scale rows
+         display_numbers = FALSE,
+         fontsize_row = 8,
+         fontsize_col = 8,
+         legend = TRUE,
+         main = "Heatmap of Scaled Mean Expression Levels by Cluster"
+)
+
+p
+
+pdf("heatmap_scaled_markers_CD8 Tcells.pdf", width = 8, height = 6)
+print(p)
+dev.off()
+
+```
+
+
+```{r pressure, echo=FALSE}
+
+
+```
+
+
+```{r pressure, echo=FALSE}
+### Dot plot ###
+
+# Define the markers you want to plot
+selected_markers <- c("CD69", "CD103", "GRZa", "GRZb", "Eomes", "CD161", "HLADR", "TCRVa72", "CD161", "CD49a", "CD31", "ECadherin")
+
+# Create the dot plot with custom size scale
+dot_plot <- DotPlot(cluster_0_cells, features = selected_markers) + 
+  scale_size_continuous(range = c(4, 10)) +  # Adjust the size range
+  scale_color_gradientn(colors = c("blue", "white", "red")) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+# Add the legend for "Percent Expressed"
+dot_plot <- dot_plot + guides(size = guide_legend(title = "Percent Expressed"))
+
+# Display the dot plot
+print(dot_plot)
+
+# Save the dot plot as a PDF file
+ggsave("dotplot_CD8 Tcells.pdf", plot = dot_plot, width = 8, height = 6)
+
+# Define your features
+features <- c("CD69","CD103", "Eomes", "GRZa", "HLADR", "TCRVa72")
+
+# Access the RNA assay data
+rna_data <- GetAssayData(cluster_0_cells, assay = "RNA", slot = "data")
+
+# Generate the FeaturePlot for each feature with the custom color scale
+plots <- lapply(features, function(feature) {
+  p <- FeaturePlot(cluster_0_cells, features = feature) +
+    scale_color_gradientn(colors = c("navy", "blue", "red", "orange"), name = "Expression", 
+                          breaks = c(min(rna_data[feature, ]), 
+                                     max(rna_data[feature, ])), 
+                          labels = c("Low", "High")) +
+    labs(title = paste("Feature:", feature)) +
+    theme_minimal() +
+    theme(panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          panel.background = element_blank(),
+          axis.line.x = element_line(color = "black"),
+          axis.line.y = element_line(color = "black"))
+  return(p)
+})
+
+# Combine the plots into one
+combined_plot <- wrap_plots(plots, ncol = 3)
+
+# Print the combined plot
+print(combined_plot)
+
+# Define the file path for the PDF
+output_pdf <- "feature_plots_CD8Tcells.pdf"
+
+# Save the combined plot as a PDF
+ggsave(output_pdf, combined_plot, device = "pdf", width = 16, height = 8)
+
+# Print a message indicating the file has been saved
+print(paste("Feature plots saved as", output_pdf))
+
+
+```
+
+
+
+
+```{r pressure, echo=FALSE}
+# Differential expression analysis between HIV and CTR within each cluster
+Idents(seurat_object) <- "seurat_clusters"
+
+# Ensure Metadata_Condition is present in the Seurat object
+if ("Metadata_Condition" %in% colnames(seurat_object[[]])) {
+  all_clusters <- unique(Idents(seurat_object))
+  cluster_de_genes0 <- list()
+
+  for (cluster in all_clusters) {
+    print(paste("Processing cluster:", cluster))
+    cluster_cells <- WhichCells(seurat_object, idents = cluster)
+    
+    hiv_cells <- intersect(cluster_cells, WhichCells(seurat_object, expression = Metadata_Condition == "HIV"))
+    ctr_cells <- intersect(cluster_cells, WhichCells(seurat_object, expression = Metadata_Condition == "CTR"))
+    
+    print(paste("Number of HIV cells in cluster", cluster, ":", length(hiv_cells)))
+    print(paste("Number of CTR cells in cluster", cluster, ":", length(ctr_cells)))
+    
+    if (length(hiv_cells) > 3 & length(ctr_cells) > 3) {  # Ensure sufficient cells in both groups
+      de_genes <- FindMarkers(seurat_object, ident.1 = hiv_cells, ident.2 = ctr_cells, test.use = "MAST", min.pct = 0, logfc.threshold = 0)
+      cluster_de_genes0[[as.character(cluster)]] <- de_genes
+    } else {
+      print(paste("Skipping cluster", cluster, "due to insufficient cells in one of the groups"))
+    }
+  }
+
+  # Create a new workbook
+  wb <- createWorkbook()
+
+  # Add a sheet and write data for each cluster
+  for (cluster in names(cluster_de_genes0)) {
+    addWorksheet(wb, paste0("Cluster_", cluster))
+    writeData(wb, sheet = paste0("Cluster_", cluster), cluster_de_genes0[[cluster]], rowNames = TRUE)
+  }
+
+  # Save the workbook to a file
+  saveWorkbook(wb, "Leukocytes_clusters.xlsx", overwrite = TRUE)
+
+  print("Differential expression results saved to Leukocytes_clusters.xlsx")
+} else {
+  print("Metadata_Condition is not found in the Seurat object.")
+}
+
+###########
+
+# Define the file path
+file_path <- "Leukocytes_clusters.xlsx"
+
+# Ensure the file exists
+if (!file.exists(file_path)) {
+  stop("File not found: ", file_path)
+}
+
+# Load the workbook
+wb <- loadWorkbook(file_path)
+
+# Get sheet names (clusters)
+sheets <- names(wb)
+
+# Check if sheets were found
+if (length(sheets) == 0) {
+  stop("No sheets found in the workbook.")
+}
+
+# Read each sheet into a list
+de_genes_list <- lapply(sheets, function(sheet) {
+  read.xlsx(wb, sheet = sheet, rowNames = TRUE)
+})
+
+# Define the order of genes for each cluster
+gene_order <- list(
+  Cluster_0 = c("CD31",	"CD45",	"GRZb",	"ECadherin",	"CD103",	"HLADR",	"Eomes",	"CD69",	"CD3",	"CD8",	"Langerin",	"GRZa",	"CD49a",	"CD4",	"CD66b",	"TCRVa72",	"CD161"),  # Define the order of genes for each cluster
+  Cluster_1 = c("CD8",	"CD31",	"HLADR",	"CD49a",	"ECadherin",	"CD45",	"Eomes",	"GRZb",	"CD69",	"CD3",	"Langerin",	"CD103",	"CD4",	"CD66b",	"GRZa",	"CD161",	"TCRVa72"),  
+  Cluster_2 = c("CD8",	"Eomes",	"CD3",	"ECadherin",	"CD45",	"CD66b",	"CD31",	"GRZb",	"HLADR",	"CD69",	"CD103",	"GRZa",	"Langerin",	"CD49a",	"CD4",	"TCRVa72",	"CD161"),
+  Cluster_3 = c("CD8",	"Eomes",	"CD45",	"GRZb",	"CD3",	"HLADR",	"GRZa",	"CD69",	"CD31",	"Langerin",	"CD103",	"CD49a",	"ECadherin",	"TCRVa72",	"CD4",	"CD161",	"CD66b")
+)
+
+
+# Generate a heatmap for each cluster
+for (i in seq_along(de_genes_list)) {
+  cluster <- sheets[i]
+  de_genes <- de_genes_list[[i]]
+  
+  # Filter significant genes
+  de_genes <- de_genes[de_genes$p_val_adj < 0.05, ]
+  
+  # Sort genes by avg_log2FC
+  de_genes <- de_genes[order(-de_genes$avg_log2FC), ]
+  
+  # Define a color scale
+  breaks <- seq(-2, 2, by = 0.1)
+  colors <- colorRampPalette(c("blue", "white", "red"))(length(breaks))
+  
+  # Prepare the matrix for heatmap
+  heatmap_data <- de_genes %>%
+    rownames_to_column("Gene") %>%
+    select(Gene, avg_log2FC) %>%
+    spread(key = Gene, value = avg_log2FC)
+  
+  # Remove genes with no values across all clusters
+  heatmap_data <- heatmap_data[rowSums(is.na(heatmap_data)) < ncol(heatmap_data), ]
+  
+  # Convert to matrix and set row names as gene names
+  heatmap_matrix <- as.matrix(heatmap_data)
+  
+  # Reorder genes based on defined order
+  if (cluster %in% names(gene_order)) {
+    heatmap_matrix <- heatmap_matrix[gene_order[[cluster]], , drop = FALSE]
+  }
+  
+  rownames(heatmap_matrix) <- heatmap_data$Gene
+  
+  # Generate heatmap
+  p <- pheatmap(
+    heatmap_matrix,
+    cluster_cols = TRUE,
+    cluster_rows = FALSE,  # Disable hierarchical clustering for genes
+    color = colors,
+    breaks = breaks,
+    show_colnames = TRUE,
+    show_rownames = TRUE,
+    main = paste("Heatmap for Cluster", cluster),
+    cellwidth = 10,     # Adjust these values to make the cells square
+    cellheight = 10     # Adjust these values to make the cells square
+  )
+  
+  # Define output file name
+  output_pdf <- paste0("heatmap_cluster_", cluster, ".pdf")
+  
+  # Save the heatmap as a PDF
+  pdf(output_pdf)
+  print(p)
+  dev.off()
+  
+  print(paste("Heatmap for cluster", cluster, "saved as", output_pdf))
+}
+
+
+```
+
+
+```{r pressure, echo=FALSE}
+# Differential expression analysis between HIV and CTR within each cluster
+Idents(seurat_object) <- "seurat_clusters"
+
+# Ensure Metadata_Condition is present in the Seurat object
+if ("Metadata_Condition" %in% colnames(seurat_object[[]])) {
+  all_clusters <- unique(Idents(seurat_object))
+  cluster_de_genes0 <- list()
+
+  for (cluster in all_clusters) {
+    print(paste("Processing cluster:", cluster))
+    cluster_cells <- WhichCells(seurat_object, idents = cluster)
+    
+    hiv_cells <- intersect(cluster_cells, WhichCells(seurat_object, expression = Metadata_Condition == "HIV"))
+    ctr_cells <- intersect(cluster_cells, WhichCells(seurat_object, expression = Metadata_Condition == "CTR"))
+    
+    print(paste("Number of HIV cells in cluster", cluster, ":", length(hiv_cells)))
+    print(paste("Number of CTR cells in cluster", cluster, ":", length(ctr_cells)))
+    
+    if (length(hiv_cells) > 3 & length(ctr_cells) > 3) {  # Ensure sufficient cells in both groups
+      de_genes <- FindMarkers(seurat_object, ident.1 = hiv_cells, ident.2 = ctr_cells, test.use = "MAST", min.pct = 0, logfc.threshold = 0)
+      cluster_de_genes0[[as.character(cluster)]] <- de_genes
+    } else {
+      print(paste("Skipping cluster", cluster, "due to insufficient cells in one of the groups"))
+    }
+  }
+
+  # Create a new workbook
+  wb <- createWorkbook()
+
+  # Add a sheet and write data for each cluster
+  for (cluster in names(cluster_de_genes0)) {
+    addWorksheet(wb, paste0("Cluster_", cluster))
+    writeData(wb, sheet = paste0("Cluster_", cluster), cluster_de_genes0[[cluster]], rowNames = TRUE)
+  }
+
+  # Save the workbook to a file
+  saveWorkbook(wb, "Leukocytes_clusters.xlsx", overwrite = TRUE)
+
+  print("Differential expression results saved to Leukocytes_clusters.xlsx")
+} else {
+  print("Metadata_Condition is not found in the Seurat object.")
+}
+
+###########
+
+# Define the file path
+file_path <- "Leukocytes_clusters.xlsx"
+
+# Ensure the file exists
+if (!file.exists(file_path)) {
+  stop("File not found: ", file_path)
+}
+
+# Load the workbook
+wb <- loadWorkbook(file_path)
+
+# Get sheet names (clusters)
+sheets <- names(wb)
+
+# Check if sheets were found
+if (length(sheets) == 0) {
+  stop("No sheets found in the workbook.")
+}
+
+# Read each sheet into a list
+de_genes_list <- lapply(sheets, function(sheet) {
+  read.xlsx(wb, sheet = sheet, rowNames = TRUE)
+})
+
+# Generate a heatmap for each cluster
+for (i in seq_along(de_genes_list)) {
+  cluster <- sheets[i]
+  de_genes <- de_genes_list[[i]]
+  
+  # Filter significant genes
+  de_genes <- de_genes[de_genes$p_val_adj < 0.05, ]
+  
+  # Debug: print the number of significant genes
+  print(paste("Number of significant genes in cluster", cluster, ":", nrow(de_genes)))
+  
+  # Sort genes by avg_log2FC
+  de_genes <- de_genes[order(-de_genes$avg_log2FC), ]
+  
+  # Extract gene names and avg_log2FC for heatmap
+  heatmap_matrix <- de_genes[, "avg_log2FC", drop = FALSE]
+  
+  # Set row names as gene names
+  rownames(heatmap_matrix) <- rownames(de_genes)
+  
+  # Define a color scale
+  breaks <- seq(-2, 2, by = 0.1)
+  colors <- colorRampPalette(c("blue", "white", "red"))(length(breaks))
+  
+  # Ensure there are enough genes to plot
+  if (nrow(heatmap_matrix) < 2) {
+    warning(paste("Not enough genes for clustering in cluster", cluster))
+    next
+  }
+  
+  # Generate heatmap
+  p <- pheatmap(
+    heatmap_matrix,
+    cluster_cols = TRUE,
+    cluster_rows = FALSE,  # Disable clustering for rows
+    color = colors,
+    breaks = breaks,
+    show_colnames = TRUE,
+    show_rownames = TRUE,
+    main = paste("Heatmap for Cluster", cluster),
+    cellwidth = 10,     # Adjust these values to make the cells square
+    cellheight = 10     # Adjust these values to make the cells square
+  )
+  
+  # Define output file name
+  output_pdf <- paste0("heatmap_cluster_", cluster, ".pdf")
+  
+  # Save the heatmap as a PDF
+  pdf(output_pdf)
+  print(p)
+  dev.off()
+  
+  print(paste("Heatmap for cluster", cluster, "saved as", output_pdf))
+}
+
+
+```
+
+
+```{r pressure, echo=FALSE}
+# Differential expression analysis between HIV and CTR within each cluster
+Idents(cluster_0_cells) <- "seurat_clusters"
+
+# Ensure Metadata_Condition is present in the Seurat object
+if ("Metadata_Condition" %in% colnames(cluster_0_cells[[]])) {
+  all_clusters <- unique(Idents(cluster_0_cells))
+  cluster_de_genes0 <- list()
+
+  for (cluster in all_clusters) {
+    print(paste("Processing cluster:", cluster))
+    cluster_cells <- WhichCells(cluster_0_cells, idents = cluster)
+    
+    hiv_cells <- intersect(cluster_cells, WhichCells(cluster_0_cells, expression = Metadata_Condition == "HIV"))
+    ctr_cells <- intersect(cluster_cells, WhichCells(cluster_0_cells, expression = Metadata_Condition == "CTR"))
+    
+    print(paste("Number of HIV cells in cluster", cluster, ":", length(hiv_cells)))
+    print(paste("Number of CTR cells in cluster", cluster, ":", length(ctr_cells)))
+    
+    if (length(hiv_cells) > 3 & length(ctr_cells) > 3) {  # Ensure sufficient cells in both groups
+      de_genes <- FindMarkers(cluster_0_cells, ident.1 = hiv_cells, ident.2 = ctr_cells, test.use = "MAST", min.pct = 0, logfc.threshold = 0)
+      cluster_de_genes0[[as.character(cluster)]] <- de_genes
+    } else {
+      print(paste("Skipping cluster", cluster, "due to insufficient cells in one of the groups"))
+    }
+  }
+
+  # Create a new workbook
+  wb <- createWorkbook()
+
+  # Add a sheet and write data for each cluster
+  for (cluster in names(cluster_de_genes0)) {
+    addWorksheet(wb, paste0("Cluster_", cluster))
+    writeData(wb, sheet = paste0("Cluster_", cluster), cluster_de_genes0[[cluster]], rowNames = TRUE)
+  }
+
+  # Save the workbook to a file
+  saveWorkbook(wb, "CD8Tcell_clusters.xlsx", overwrite = TRUE)
+
+  print("Differential expression results saved to CD8Tcell_clusters.xlsx")
+} else {
+  print("Metadata_Condition is not found in the Seurat object.")
+}
+
+###########
+
+
+# Define the file path
+file_path <- "CD8Tcell_clusters.xlsx"
+
+# Ensure the file exists
+if (!file.exists(file_path)) {
+  stop("File not found: ", file_path)
+}
+
+# Load the workbook
+wb <- loadWorkbook(file_path)
+
+# Get sheet names (clusters)
+sheets <- names(wb)
+
+# Check if sheets were found
+if (length(sheets) == 0) {
+  stop("No sheets found in the workbook.")
+}
+
+# Read each sheet into a list
+de_genes_list <- lapply(sheets, function(sheet) {
+  read.xlsx(wb, sheet = sheet, rowNames = TRUE)
+})
+
+# Combine all data into one dataframe, adding cluster information
+all_de_genes <- bind_rows(
+  lapply(seq_along(de_genes_list), function(i) {
+    cluster <- sheets[i]
+    de_genes_list[[i]] %>% 
+      mutate(Cluster = cluster, Gene = rownames(.)) %>%
+      select(Gene, avg_log2FC, Cluster)
+  })
+)
+
+# Define a color scale
+breaks <- seq(-2, 2, by = 0.1)
+colors <- colorRampPalette(c("blue", "white", "red"))(length(breaks))
+
+# Prepare the matrix for heatmap
+heatmap_data <- spread(all_de_genes, key = Cluster, value = avg_log2FC)
+
+# Remove genes with no values across all clusters
+heatmap_data <- heatmap_data[rowSums(is.na(heatmap_data)) < ncol(heatmap_data), ]
+
+# Convert to matrix and set row names as gene names
+heatmap_matrix <- as.matrix(heatmap_data[,-1]) # Assuming first column is Gene
+rownames(heatmap_matrix) <- heatmap_data$Gene
+
+CD8T <- pheatmap(
+  heatmap_matrix,
+  cluster_cols = TRUE,
+  cluster_rows = TRUE,
+  color = colors,
+  breaks = breaks,
+  show_colnames = TRUE,
+  show_rownames = TRUE,
+  main = "" # Remove the default title
+)
+
+# Define output file name
+output_pdf <- "./heatmap.pdf"
+
+# Save the heatmap as a PDF
+pdf(output_pdf)
+CD8T
+dev.off()
+
+
+print(paste("Heatmap saved as", output_pdf))
+
+
+
+```
+
+
+```{r pressure, echo=FALSE}
+
+###Subcluster CD4 T cells###
+
+# Subset the Seurat object to include only cells from cluster 0
+cluster_1_cells <- subset(seurat_object, idents = 1)
+
+# Normalize the subset data
+cluster_1_cells <- NormalizeData(cluster_1_cells)
+
+# Find variable features
+# cluster_0_cells <- FindVariableFeatures(cluster_0_cells)
+
+VariableFeatures(cluster_1_cells) <- c("CD103", "ECadherin", "HLADR", "CD161", "GRZb", "Eomes", "CD69", "GRZa")
+
+# Scale the data
+cluster_1_cells <- ScaleData(cluster_1_cells)
+
+# Perform PCA
+cluster_1_cells <- RunPCA(cluster_1_cells)
+
+# Perform Harmony integration if necessary
+cluster_1_cells <- harmony::RunHarmony(
+  object = cluster_1_cells,
+  assay = "RNA",
+  group.by = "Metadata_ID",
+  theta = 3
+)
+
+# Perform UMAP with Harmony reduction
+cluster_1_cells <- RunUMAP(cluster_1_cells, reduction = "harmony", dims = 1:7)
+
+# Find neighbors and clusters within cluster 0 cells
+cluster_1_cells <- FindNeighbors(cluster_1_cells, reduction = "harmony", dims = 1:7)
+cluster_1_cells <- FindClusters(cluster_1_cells, resolution = 0.15)  # You can adjust the resolution parameter
+
+# Visualize the subclusters
+DimPlot(cluster_1_cells, reduction = "umap", label = TRUE) + ggtitle("CD4 T cells")
+DoHeatmap(cluster_1_cells)
+#DimPlot(cluster_1_cells, reduction = "umap", label = TRUE, group.by = "Metadata_ID")
+#DimPlot(cluster_1_cells, reduction = "umap", group.by = "Metadata_Condition") + ggtitle("CD4 T cells")
+cluster_1_cells_ctr <- subset(cluster_1_cells, subset = Metadata_Condition == "CTR")
+DimPlot(cluster_1_cells_ctr, reduction = "umap", label = TRUE) + ggtitle("CTR Cells in Each Cluster")
+cluster_1_cells_hiv <- subset(cluster_1_cells, subset = Metadata_Condition == "HIV")
+DimPlot(cluster_1_cells_hiv, reduction = "umap", label = TRUE) + ggtitle("HIV Cells in Each Cluster")
+
+
+
+```
+
+```{r pressure, echo=FALSE}
+### Generate stack plot for percentage of CD4 T cells ###
+
+# Subset Seurat object for HIV and CTR conditions
+seurat_hiv <- subset(cluster_1_cells, subset = Metadata_Condition == "HIV")
+seurat_ctr <- subset(cluster_1_cells, subset = Metadata_Condition == "CTR")
+
+# Calculate the percentage of cells in each cluster for each individual
+calculate_cluster_percentage <- function(seurat_obj) {
+  cell_counts <- table(Idents(seurat_obj), seurat_obj$Metadata_ID)
+  total_counts <- colSums(cell_counts)
+  cluster_percentages <- sweep(cell_counts, 2, total_counts, FUN = "/") * 100
+  
+  # Convert the table to a data frame with proper row and column names
+  cluster_percentages <- as.data.frame(as.table(cluster_percentages))
+  colnames(cluster_percentages) <- c("Cluster", "Individual", "Percentage")
+  
+  return(cluster_percentages)
+}
+
+hiv_cluster_percentages <- calculate_cluster_percentage(seurat_hiv)
+ctr_cluster_percentages <- calculate_cluster_percentage(seurat_ctr)
+
+# Combine the results into one data frame and add the condition label
+hiv_cluster_percentages$Condition <- "HIV"
+ctr_cluster_percentages$Condition <- "CTR"
+combined_percentages <- rbind(hiv_cluster_percentages, ctr_cluster_percentages)
+
+# Verify the consistency in the combined percentages
+cat("Combined Cluster Percentages:\n")
+print(combined_percentages)
+print(table(combined_percentages$Cluster, combined_percentages$Condition))
+
+# Perform Mann-Whitney U test for each cluster
+mann_whitney_results <- combined_percentages %>%
+  group_by(Cluster) %>%
+  wilcox_test(Percentage ~ Condition)
+
+# Print and save the results
+print(mann_whitney_results)
+write.xlsx(mann_whitney_results, file = "CD4_Tcells_Percent_Individual.xlsx")
+
+# Calculate the percentage of cells in each cluster for HIV and CTR for plotting
+calculate_total_percentages <- function(seurat_obj) {
+  cluster_counts <- table(Idents(seurat_obj))
+  total_counts <- sum(cluster_counts)
+  cluster_percentages <- (cluster_counts / total_counts) * 100
+  return(cluster_percentages)
+}
+
+hiv_total_percentages <- calculate_total_percentages(seurat_hiv)
+ctr_total_percentages <- calculate_total_percentages(seurat_ctr)
+
+# Combine the total percentages for plotting
+plot_percentages <- data.frame(
+  Cluster = names(hiv_total_percentages),
+  HIV_Percentage = as.numeric(hiv_total_percentages),
+  CTR_Percentage = as.numeric(ctr_total_percentages)
+)
+
+# Reshape the data for plotting
+plot_percentages_long <- gather(plot_percentages, Condition, Percentage, -Cluster)
+
+# Define custom colors (replace with the actual colors from DimPlot if known)
+dimplot_colors <- scales::hue_pal()(length(unique(plot_percentages_long$Cluster)))
+
+# Create the stacked bar plot
+p <- ggplot(plot_percentages_long, aes(x = Condition, y = Percentage, fill = Cluster)) +
+  geom_bar(stat = "identity", position = "stack") +
+  labs(title = "Percentage of Cells in Each Cluster by Condition",
+       x = "Condition",
+       y = "Percentage of Cells") +
+  scale_fill_manual(values = dimplot_colors) +
+  theme_minimal() +
+  theme(
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.background = element_blank(),
+    axis.line = element_line(colour = "black")
+  )
+
+# Save the plot as a PDF
+ggsave("CD4_Tcells_Percent_clusters.pdf", p)
+
+
+```
+
+
+```{r pressure, echo=FALSE}
+### Generate stack plot for count of cells ###
+
+# Subset Seurat object for HIV and CTR conditions
+seurat_hiv <- subset(cluster_1_cells, subset = Metadata_Condition == "HIV")
+seurat_ctr <- subset(cluster_1_cells, subset = Metadata_Condition == "CTR")
+
+# Function to calculate cluster counts for each individual
+calculate_cluster_counts <- function(cluster_1_cells) {
+  cell_counts <- table(Idents(cluster_1_cells), cluster_1_cells$Metadata_ID)
+  
+  # Convert the table to a data frame with proper row and column names
+  cluster_counts <- as.data.frame(cell_counts)
+  colnames(cluster_counts) <- c("Cluster", "Individual", "Count")
+  
+  return(cluster_counts)
+}
+
+# Calculate cluster counts for HIV and CTR
+hiv_cluster_counts <- calculate_cluster_counts(seurat_hiv)
+ctr_cluster_counts <- calculate_cluster_counts(seurat_ctr)
+
+# Combine counts and add condition label
+hiv_cluster_counts$Condition <- "HIV"
+ctr_cluster_counts$Condition <- "CTR"
+combined_counts <- rbind(hiv_cluster_counts, ctr_cluster_counts)
+
+# Print combined counts for verification
+cat("Combined Cluster Counts:\n")
+print(combined_counts)
+
+# Verify the consistency in the combined counts
+print(table(combined_counts$Cluster, combined_counts$Condition))
+
+# Perform Mann-Whitney U test for each cluster
+mann_whitney_results_counts <- combined_counts %>%
+  group_by(Cluster) %>%
+  wilcox_test(Count ~ Condition)
+
+# Print and save the results
+print(mann_whitney_results_counts)
+write.xlsx(mann_whitney_results_counts, file = "CD4_Tcells_Count_Individual.xlsx")
+
+# Calculate the total counts of cells in each cluster for plotting
+calculate_total_counts <- function(seurat_obj) {
+  cluster_counts <- table(Idents(seurat_obj))
+  return(cluster_counts)
+}
+
+hiv_total_counts <- calculate_total_counts(seurat_hiv)
+ctr_total_counts <- calculate_total_counts(seurat_ctr)
+
+# Combine the total counts for plotting
+plot_counts <- data.frame(
+  Cluster = names(hiv_total_counts),
+  HIV_Count = as.numeric(hiv_total_counts),
+  CTR_Count = as.numeric(ctr_total_counts)
+)
+
+# Reshape the data for plotting
+plot_counts_long <- gather(plot_counts, Condition, Count, -Cluster)
+
+# Define custom colors (replace with the actual colors from DimPlot if known)
+dimplot_colors_counts <- scales::hue_pal()(length(unique(plot_counts_long$Cluster)))
+
+# Create the stacked bar plot for counts
+p_counts <- ggplot(plot_counts_long, aes(x = Condition, y = Count, fill = Cluster)) +
+  geom_bar(stat = "identity", position = "stack") +
+  labs(title = "Count of Cells in Each Cluster by Condition",
+       x = "Condition",
+       y = "Count of Cells") +
+  scale_fill_manual(values = dimplot_colors_counts) +
+  theme_minimal() +
+  theme(
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.background = element_blank(),
+    axis.line = element_line(colour = "black")
+  )
+
+# Save the plot as a PDF
+ggsave("CD4_Tcells_Count_clusters.pdf", p_counts)
+
+```
+
+
+
+```{r pressure, echo=FALSE}
+# Get the cluster labels from the Seurat object
+cluster_labels <- levels(Idents(cluster_1_cells))
+
+cluster_mean_expression <- AggregateExpression(object = cluster_1_cells, by = "RNA_snn_res.0.15")
+
+# Update the cluster names in cluster_mean_expression
+colnames(cluster_mean_expression$RNA) <- cluster_labels
+
+# Convert cluster_mean_expression to a matrix
+cluster_mean_matrix <- as.matrix(cluster_mean_expression$RNA)
+
+# Reorder columns of cluster_mean_matrix based on cluster_order
+cluster_mean_matrix <- cluster_mean_matrix[, match(cluster_order, colnames(cluster_mean_matrix))]
+
+# Define the color gradient
+color_gradient <- colorRampPalette(c("blue", "white", "red"))(100)
+
+# Optionally log-transform the data (adding a small constant to avoid log(0))
+log_cluster_mean_matrix <- log2(cluster_mean_matrix + 1)
+
+# Generate the heatmap with the log-transformed data
+p <- pheatmap(log_cluster_mean_matrix,
+         color = color_gradient,
+         cluster_rows = TRUE,       # Hierarchical clustering of rows (genes)
+         cluster_cols = FALSE,      # Do not cluster columns (clusters)
+         display_numbers = FALSE,   # Hide numbers on tiles
+         fontsize_row = 8,          # Font size for row labels
+         fontsize_col = 8,          # Font size for column labels
+         legend = TRUE,             # Show legend
+         main = "Heatmap of Log-Transformed Mean Expression Levels by Cluster"
+)
+
+p
+
+# Save the heatmap as a PDF file
+pdf("heatmap_logIntens_CD4 Tcells.pdf", width = 8, height = 6)
+print(p)
+dev.off()
+
+# Optionally, you can scale the rows to enhance contrast for each gene
+p <- pheatmap(cluster_mean_matrix,
+         color = color_gradient,
+         cluster_rows = TRUE,
+         cluster_cols = FALSE,      # Do not cluster columns (clusters)
+         scale = "row",             # Scale rows
+         display_numbers = FALSE,
+         fontsize_row = 8,
+         fontsize_col = 8,
+         legend = TRUE,
+         main = "Heatmap of Scaled Mean Expression Levels by Cluster"
+)
+
+p
+
+pdf("heatmap_scaled_markers_CD4 Tcells.pdf", width = 8, height = 6)
+print(p)
+dev.off()
+
+```
+
+
+
+```{r pressure, echo=FALSE}
+
+# Define the markers you want to plot
+selected_markers <- c("CD69", "CD103", "GRZa", "GRZb", "Eomes", "CD161", "HLADR", "TCRVa72", "CD49a", "CD31", "ECadherin")
+
+# Create the dot plot with custom size scale
+dot_plot <- DotPlot(cluster_1_cells, features = selected_markers) + 
+  scale_size_continuous(range = c(4, 10)) +  # Adjust the size range
+  scale_color_gradientn(colors = c("blue", "white", "red")) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+# Add the legend for "Percent Expressed"
+dot_plot <- dot_plot + guides(size = guide_legend(title = "Percent Expressed"))
+
+# Display the dot plot
+print(dot_plot)
+
+# Save the dot plot as a PDF file
+ggsave("dotplot_CD4 Tcells.pdf", plot = dot_plot, width = 8, height = 6)
+
+# Define your features
+features <- c("CD69","CD103", "Eomes", "HLADR", "CD161", "TCRVa72")
+
+# Access the RNA assay data
+rna_data <- GetAssayData(cluster_1_cells, assay = "RNA", slot = "data")
+
+# Generate the FeaturePlot for each feature with the custom color scale
+plots <- lapply(features, function(feature) {
+  p <- FeaturePlot(cluster_1_cells, features = feature) +
+    scale_color_gradientn(colors = c("navy", "blue", "red", "orange"), name = "Expression", 
+                          breaks = c(min(rna_data[feature, ]), 
+                                     max(rna_data[feature, ])), 
+                          labels = c("Low", "High")) +
+    labs(title = paste("Feature:", feature)) +
+    theme_minimal() +
+    theme(panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          panel.background = element_blank(),
+          axis.line.x = element_line(color = "black"),
+          axis.line.y = element_line(color = "black"))
+  return(p)
+})
+
+# Combine the plots into one
+combined_plot <- wrap_plots(plots, ncol = 3)
+
+# Print the combined plot
+print(combined_plot)
+
+# Define the file path for the PDF
+output_pdf <- "feature_plots_CD4Tcells.pdf"
+
+# Save the combined plot as a PDF
+ggsave(output_pdf, combined_plot, device = "pdf", width = 16, height = 8)
+
+# Print a message indicating the file has been saved
+print(paste("Feature plots saved as", output_pdf))
+
+
+
+```
+
+
+
+
+```{r pressure, echo=FALSE}
+
+# Differential expression analysis between HIV and CTR within each cluster
+Idents(cluster_1_cells) <- "seurat_clusters"
+
+# Ensure Metadata_Condition is present in the Seurat object
+if ("Metadata_Condition" %in% colnames(cluster_1_cells[[]])) {
+  all_clusters <- unique(Idents(cluster_1_cells))
+  cluster_de_genes1 <- list()
+
+  for (cluster in all_clusters) {
+    print(paste("Processing cluster:", cluster))
+    cluster_cells <- WhichCells(cluster_1_cells, idents = cluster)
+    
+    hiv_cells <- intersect(cluster_cells, WhichCells(cluster_1_cells, expression = Metadata_Condition == "HIV"))
+    ctr_cells <- intersect(cluster_cells, WhichCells(cluster_1_cells, expression = Metadata_Condition == "CTR"))
+    
+    print(paste("Number of HIV cells in cluster", cluster, ":", length(hiv_cells)))
+    print(paste("Number of CTR cells in cluster", cluster, ":", length(ctr_cells)))
+    
+    if (length(hiv_cells) > 3 & length(ctr_cells) > 3) {  # Ensure sufficient cells in both groups
+      de_genes <- FindMarkers(cluster_1_cells, ident.1 = hiv_cells, ident.2 = ctr_cells, test.use = "MAST", min.pct = 0, logfc.threshold = 0)
+      cluster_de_genes1[[as.character(cluster)]] <- de_genes
+    } else {
+      print(paste("Skipping cluster", cluster, "due to insufficient cells in one of the groups"))
+    }
+  }
+
+  # Create a new workbook
+  wb <- createWorkbook()
+
+  # Add a sheet and write data for each cluster
+  for (cluster in names(cluster_de_genes1)) {
+    addWorksheet(wb, paste0("Cluster_", cluster))
+    writeData(wb, sheet = paste0("Cluster_", cluster), cluster_de_genes1[[cluster]], rowNames = TRUE)
+  }
+
+  # Save the workbook to a file
+  saveWorkbook(wb, "CD4Tcell_clusters.xlsx", overwrite = TRUE)
+
+  print("Differential expression results saved to CD4Tcell_clusters.xlsx")
+} else {
+  print("Metadata_Condition is not found in the Seurat object.")
+}
+
+###########
+
+
+# Define the file path
+file_path <- "CD4Tcell_clusters.xlsx"
+
+# Ensure the file exists
+if (!file.exists(file_path)) {
+  stop("File not found: ", file_path)
+}
+
+# Load the workbook
+wb <- loadWorkbook(file_path)
+
+# Get sheet names (clusters)
+sheets <- names(wb)
+
+# Check if sheets were found
+if (length(sheets) == 0) {
+  stop("No sheets found in the workbook.")
+}
+
+# Read each sheet into a list
+de_genes_list <- lapply(sheets, function(sheet) {
+  read.xlsx(wb, sheet = sheet, rowNames = TRUE)
+})
+
+# Combine all data into one dataframe, adding cluster information
+all_de_genes <- bind_rows(
+  lapply(seq_along(de_genes_list), function(i) {
+    cluster <- sheets[i]
+    de_genes_list[[i]] %>% 
+      mutate(Cluster = cluster, Gene = rownames(.)) %>%
+      select(Gene, avg_log2FC, Cluster)
+  })
+)
+
+# Define a color scale
+breaks <- seq(-2, 2, by = 0.1)
+colors <- colorRampPalette(c("blue", "white", "red"))(length(breaks))
+
+# Prepare the matrix for heatmap
+heatmap_data <- spread(all_de_genes, key = Cluster, value = avg_log2FC)
+
+# Remove genes with no values across all clusters
+heatmap_data <- heatmap_data[rowSums(is.na(heatmap_data)) < ncol(heatmap_data), ]
+
+# Convert to matrix and set row names as gene names
+heatmap_matrix <- as.matrix(heatmap_data[,-1]) # Assuming first column is Gene
+rownames(heatmap_matrix) <- heatmap_data$Gene
+
+CD4T <- pheatmap(
+  heatmap_matrix,
+  cluster_cols = TRUE,
+  cluster_rows = TRUE,
+  color = colors,
+  breaks = breaks,
+  show_colnames = TRUE,
+  show_rownames = TRUE,
+  main = "" # Remove the default title
+)
+
+# Define output file name
+output_pdf <- "./heatmap.pdf"
+
+# Save the heatmap as a PDF
+pdf(output_pdf)
+CD4T
+dev.off()
+
+
+print(paste("Heatmap saved as", output_pdf))
+
+
+```
+
+
+
+```{r pressure, echo=FALSE}
+###Subcluster non T cells ###
+
+# Subset the Seurat object to include only cells from cluster 0
+cluster_2_cells <- subset(seurat_object, idents = 2)
+
+# Normalize the subset data
+cluster_2_cells <- NormalizeData(cluster_2_cells)
+
+# Find variable features
+# cluster_0_cells <- FindVariableFeatures(cluster_0_cells)
+
+VariableFeatures(cluster_2_cells) <- c("CD103", "ECadherin", "CD4", "HLADR", "CD161", "GRZb", "Eomes", "CD69", "GRZa", "Langerin", "CD8")
+
+# Scale the data
+cluster_2_cells <- ScaleData(cluster_2_cells)
+
+# Perform PCA
+cluster_2_cells <- RunPCA(cluster_2_cells)
+
+# Perform Harmony integration if necessary
+cluster_2_cells <- harmony::RunHarmony(
+  object = cluster_2_cells,
+  assay = "RNA",
+  group.by = "Metadata_ID",
+  theta = 3
+)
+
+# Perform UMAP with Harmony reduction
+cluster_2_cells <- RunUMAP(cluster_2_cells, reduction = "harmony", dims = 1:9)
+
+# Find neighbors and clusters within cluster 0 cells
+cluster_2_cells <- FindNeighbors(cluster_2_cells, reduction = "harmony", dims = 1:9)
+cluster_2_cells <- FindClusters(cluster_2_cells, resolution = 0.13)  # You can adjust the resolution parameter
+
+# Visualize the subclusters
+DimPlot(cluster_2_cells, reduction = "umap", label = TRUE) + ggtitle("Other")
+DoHeatmap(cluster_2_cells)
+#DimPlot(cluster_3_cells, reduction = "umap", label = TRUE, group.by = "Metadata_ID")
+cluster_2_cells_ctr <- subset(cluster_2_cells, subset = Metadata_Condition == "CTR")
+DimPlot(cluster_2_cells_ctr, reduction = "umap", label = TRUE) + ggtitle("CTR Cells in Each Cluster")
+cluster_2_cells_hiv <- subset(cluster_2_cells, subset = Metadata_Condition == "HIV")
+DimPlot(cluster_2_cells_hiv, reduction = "umap", label = TRUE) + ggtitle("HIV Cells in Each Cluster")
+
+
+```
+
+
+```{r pressure, echo=FALSE}
+### Generate stack plot for percentage of non-T cells ###
+
+# Subset Seurat object for HIV and CTR conditions
+seurat_hiv <- subset(cluster_2_cells, subset = Metadata_Condition == "HIV")
+seurat_ctr <- subset(cluster_2_cells, subset = Metadata_Condition == "CTR")
+
+# Calculate the percentage of cells in each cluster for each individual
+calculate_cluster_percentage <- function(seurat_obj) {
+  cell_counts <- table(Idents(seurat_obj), seurat_obj$Metadata_ID)
+  total_counts <- colSums(cell_counts)
+  cluster_percentages <- sweep(cell_counts, 2, total_counts, FUN = "/") * 100
+  
+  # Convert the table to a data frame with proper row and column names
+  cluster_percentages <- as.data.frame(as.table(cluster_percentages))
+  colnames(cluster_percentages) <- c("Cluster", "Individual", "Percentage")
+  
+  return(cluster_percentages)
+}
+
+hiv_cluster_percentages <- calculate_cluster_percentage(seurat_hiv)
+ctr_cluster_percentages <- calculate_cluster_percentage(seurat_ctr)
+
+# Combine the results into one data frame and add the condition label
+hiv_cluster_percentages$Condition <- "HIV"
+ctr_cluster_percentages$Condition <- "CTR"
+combined_percentages <- rbind(hiv_cluster_percentages, ctr_cluster_percentages)
+
+# Verify the consistency in the combined percentages
+cat("Combined Cluster Percentages:\n")
+print(combined_percentages)
+print(table(combined_percentages$Cluster, combined_percentages$Condition))
+
+# Perform Mann-Whitney U test for each cluster
+mann_whitney_results <- combined_percentages %>%
+  group_by(Cluster) %>%
+  wilcox_test(Percentage ~ Condition)
+
+# Print and save the results
+print(mann_whitney_results)
+write.xlsx(mann_whitney_results, file = "non Tcells_Percent_Individual.xlsx")
+
+# Calculate the percentage of cells in each cluster for HIV and CTR for plotting
+calculate_total_percentages <- function(seurat_obj) {
+  cluster_counts <- table(Idents(seurat_obj))
+  total_counts <- sum(cluster_counts)
+  cluster_percentages <- (cluster_counts / total_counts) * 100
+  return(cluster_percentages)
+}
+
+hiv_total_percentages <- calculate_total_percentages(seurat_hiv)
+ctr_total_percentages <- calculate_total_percentages(seurat_ctr)
+
+# Combine the total percentages for plotting
+plot_percentages <- data.frame(
+  Cluster = names(hiv_total_percentages),
+  HIV_Percentage = as.numeric(hiv_total_percentages),
+  CTR_Percentage = as.numeric(ctr_total_percentages)
+)
+
+# Reshape the data for plotting
+plot_percentages_long <- gather(plot_percentages, Condition, Percentage, -Cluster)
+
+# Define custom colors (replace with the actual colors from DimPlot if known)
+dimplot_colors <- scales::hue_pal()(length(unique(plot_percentages_long$Cluster)))
+
+# Create the stacked bar plot
+p <- ggplot(plot_percentages_long, aes(x = Condition, y = Percentage, fill = Cluster)) +
+  geom_bar(stat = "identity", position = "stack") +
+  labs(title = "Percentage of Cells in Each Cluster by Condition",
+       x = "Condition",
+       y = "Percentage of Cells") +
+  scale_fill_manual(values = dimplot_colors) +
+  theme_minimal() +
+  theme(
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.background = element_blank(),
+    axis.line = element_line(colour = "black")
+  )
+
+# Save the plot as a PDF
+ggsave("non Tcells_Percent_clusters.pdf", p)
+
+
+```
+
+
+```{r pressure, echo=FALSE}
+### Generate stack plot for count of cells ###
+
+# Subset Seurat object for HIV and CTR conditions
+seurat_hiv <- subset(cluster_2_cells, subset = Metadata_Condition == "HIV")
+seurat_ctr <- subset(cluster_2_cells, subset = Metadata_Condition == "CTR")
+
+# Function to calculate cluster counts for each individual
+calculate_cluster_counts <- function(cluster_2_cells) {
+  cell_counts <- table(Idents(cluster_2_cells), cluster_2_cells$Metadata_ID)
+  
+  # Convert the table to a data frame with proper row and column names
+  cluster_counts <- as.data.frame(cell_counts)
+  colnames(cluster_counts) <- c("Cluster", "Individual", "Count")
+  
+  return(cluster_counts)
+}
+
+# Calculate cluster counts for HIV and CTR
+hiv_cluster_counts <- calculate_cluster_counts(seurat_hiv)
+ctr_cluster_counts <- calculate_cluster_counts(seurat_ctr)
+
+# Combine counts and add condition label
+hiv_cluster_counts$Condition <- "HIV"
+ctr_cluster_counts$Condition <- "CTR"
+combined_counts <- rbind(hiv_cluster_counts, ctr_cluster_counts)
+
+# Print combined counts for verification
+cat("Combined Cluster Counts:\n")
+print(combined_counts)
+
+# Verify the consistency in the combined counts
+print(table(combined_counts$Cluster, combined_counts$Condition))
+
+# Perform Mann-Whitney U test for each cluster
+mann_whitney_results_counts <- combined_counts %>%
+  group_by(Cluster) %>%
+  wilcox_test(Count ~ Condition)
+
+# Print and save the results
+print(mann_whitney_results_counts)
+write.xlsx(mann_whitney_results_counts, file = "non Tcells_Count_Individual.xlsx")
+
+# Calculate the total counts of cells in each cluster for plotting
+calculate_total_counts <- function(seurat_obj) {
+  cluster_counts <- table(Idents(seurat_obj))
+  return(cluster_counts)
+}
+
+hiv_total_counts <- calculate_total_counts(seurat_hiv)
+ctr_total_counts <- calculate_total_counts(seurat_ctr)
+
+# Combine the total counts for plotting
+plot_counts <- data.frame(
+  Cluster = names(hiv_total_counts),
+  HIV_Count = as.numeric(hiv_total_counts),
+  CTR_Count = as.numeric(ctr_total_counts)
+)
+
+# Reshape the data for plotting
+plot_counts_long <- gather(plot_counts, Condition, Count, -Cluster)
+
+# Define custom colors (replace with the actual colors from DimPlot if known)
+dimplot_colors_counts <- scales::hue_pal()(length(unique(plot_counts_long$Cluster)))
+
+# Create the stacked bar plot for counts
+p_counts <- ggplot(plot_counts_long, aes(x = Condition, y = Count, fill = Cluster)) +
+  geom_bar(stat = "identity", position = "stack") +
+  labs(title = "Count of Cells in Each Cluster by Condition",
+       x = "Condition",
+       y = "Count of Cells") +
+  scale_fill_manual(values = dimplot_colors_counts) +
+  theme_minimal() +
+  theme(
+    panel.grid.major = element_blank(),
+    panel.grid.minor = element_blank(),
+    panel.background = element_blank(),
+    axis.line = element_line(colour = "black")
+  )
+
+# Save the plot as a PDF
+ggsave("non Tcells_Count_clusters.pdf", p_counts)
+
+```
+
+
+
+
+```{r pressure, echo=FALSE}
+# Get the cluster labels from the Seurat object
+cluster_labels <- levels(Idents(cluster_2_cells))
+
+cluster_mean_expression <- AggregateExpression(object = cluster_2_cells, by = "RNA_snn_res.0.15")
+
+# Update the cluster names in cluster_mean_expression
+colnames(cluster_mean_expression$RNA) <- cluster_labels
+
+# Convert cluster_mean_expression to a matrix
+cluster_mean_matrix <- as.matrix(cluster_mean_expression$RNA)
+
+# Reorder columns of cluster_mean_matrix based on cluster_order
+cluster_mean_matrix <- cluster_mean_matrix[, match(cluster_order, colnames(cluster_mean_matrix))]
+
+# Define the color gradient
+color_gradient <- colorRampPalette(c("blue", "white", "red"))(100)
+
+# Optionally log-transform the data (adding a small constant to avoid log(0))
+log_cluster_mean_matrix <- log2(cluster_mean_matrix + 1)
+
+# Generate the heatmap with the log-transformed data
+p <- pheatmap(log_cluster_mean_matrix,
+         color = color_gradient,
+         cluster_rows = TRUE,       # Hierarchical clustering of rows (genes)
+         cluster_cols = FALSE,      # Do not cluster columns (clusters)
+         display_numbers = FALSE,   # Hide numbers on tiles
+         fontsize_row = 8,          # Font size for row labels
+         fontsize_col = 8,          # Font size for column labels
+         legend = TRUE,             # Show legend
+         main = "Heatmap of Log-Transformed Mean Expression Levels by Cluster"
+)
+
+p
+
+# Save the heatmap as a PDF file
+pdf("heatmap_logIntens_Non Tcells.pdf", width = 8, height = 6)
+print(p)
+dev.off()
+
+# Optionally, you can scale the rows to enhance contrast for each gene
+p <- pheatmap(cluster_mean_matrix,
+         color = color_gradient,
+         cluster_rows = TRUE,
+         cluster_cols = FALSE,      # Do not cluster columns (clusters)
+         scale = "row",             # Scale rows
+         display_numbers = FALSE,
+         fontsize_row = 8,
+         fontsize_col = 8,
+         legend = TRUE,
+         main = "Heatmap of Scaled Mean Expression Levels by Cluster"
+)
+
+p
+
+pdf("heatmap_scaled_markers_Non Tcells.pdf", width = 8, height = 6)
+print(p)
+dev.off()
+
+```
+
+
+
+```{r pressure, echo=FALSE}
+### Dot plot ###
+
+# Define the markers you want to plot
+selected_markers <- c("CD3","CD8", "CD4", "CD69", "CD103", "GRZa", "GRZb", "Eomes", "CD161", "HLADR", "TCRVa72", "Langerin", "CD49a", "CD31", "ECadherin", "CD66b")
+
+# Create the dot plot with custom size scale
+dot_plot <- DotPlot(cluster_2_cells, features = selected_markers) + 
+  scale_size_continuous(range = c(4, 10)) +  # Adjust the size range
+  scale_color_gradientn(colors = c("blue", "white", "red")) +
+  theme(axis.text.x = element_text(angle = 90, hjust = 1))
+
+# Add the legend for "Percent Expressed"
+dot_plot <- dot_plot + guides(size = guide_legend(title = "Percent Expressed"))
+
+# Display the dot plot
+print(dot_plot)
+
+# Save the dot plot as a PDF file
+ggsave("dotplot_Non T cells.pdf", plot = dot_plot, width = 8, height = 6)
+
+# Define your features
+features <- c("CD8","CD4", "HLADR", "Langerin", "GRZa", "Eomes")
+
+# Access the RNA assay data
+rna_data <- GetAssayData(cluster_2_cells, assay = "RNA", slot = "data")
+
+# Generate the FeaturePlot for each feature with the custom color scale
+plots <- lapply(features, function(feature) {
+  p <- FeaturePlot(cluster_2_cells, features = feature) +
+    scale_color_gradientn(colors = c("navy", "blue", "red", "orange"), name = "Expression", 
+                          breaks = c(min(rna_data[feature, ]), 
+                                     max(rna_data[feature, ])), 
+                          labels = c("Low", "High")) +
+    labs(title = paste("Feature:", feature)) +
+    theme_minimal() +
+    theme(panel.grid.major = element_blank(),
+          panel.grid.minor = element_blank(),
+          panel.background = element_blank(),
+          axis.line.x = element_line(color = "black"),
+          axis.line.y = element_line(color = "black"))
+  return(p)
+})
+
+# Combine the plots into one
+combined_plot <- wrap_plots(plots, ncol = 2)
+
+# Print the combined plot
+print(combined_plot)
+
+# Define the file path for the PDF
+output_pdf <- "feature_plots_Non T cells.pdf"
+
+# Save the combined plot as a PDF
+ggsave(output_pdf, combined_plot, device = "pdf", width = 12, height = 12)
+
+# Print a message indicating the file has been saved
+print(paste("Feature plots saved as", output_pdf))
+
+
+```
+
+
+```{r pressure, echo=FALSE}
+
+# Differential expression analysis between HIV and CTR within each cluster
+Idents(cluster_2_cells) <- "seurat_clusters"
+
+# Ensure Metadata_Condition is present in the Seurat object
+if ("Metadata_Condition" %in% colnames(cluster_2_cells[[]])) {
+  all_clusters <- unique(Idents(cluster_2_cells))
+  cluster_de_genes2 <- list()
+
+  for (cluster in all_clusters) {
+    print(paste("Processing cluster:", cluster))
+    cluster_cells <- WhichCells(cluster_2_cells, idents = cluster)
+    
+    hiv_cells <- intersect(cluster_cells, WhichCells(cluster_2_cells, expression = Metadata_Condition == "HIV"))
+    ctr_cells <- intersect(cluster_cells, WhichCells(cluster_2_cells, expression = Metadata_Condition == "CTR"))
+    
+    print(paste("Number of HIV cells in cluster", cluster, ":", length(hiv_cells)))
+    print(paste("Number of CTR cells in cluster", cluster, ":", length(ctr_cells)))
+    
+    if (length(hiv_cells) > 3 & length(ctr_cells) > 3) {  # Ensure sufficient cells in both groups
+      de_genes <- FindMarkers(cluster_2_cells, ident.1 = hiv_cells, ident.2 = ctr_cells, test.use = "MAST", min.pct = 0, logfc.threshold = 0)
+      cluster_de_genes2[[as.character(cluster)]] <- de_genes
+    } else {
+      print(paste("Skipping cluster", cluster, "due to insufficient cells in one of the groups"))
+    }
+  }
+
+  # Create a new workbook
+  wb <- createWorkbook()
+
+  # Add a sheet and write data for each cluster
+  for (cluster in names(cluster_de_genes2)) {
+    addWorksheet(wb, paste0("Cluster_", cluster))
+    writeData(wb, sheet = paste0("Cluster_", cluster), cluster_de_genes2[[cluster]], rowNames = TRUE)
+  }
+
+  # Save the workbook to a file
+  saveWorkbook(wb, "nonTcell_clusters.xlsx", overwrite = TRUE)
+
+  print("Differential expression results saved to nonTcell_clusters.xlsx")
+} else {
+  print("Metadata_Condition is not found in the Seurat object.")
+}
+
+###########
+
+
+# Define the file path
+file_path <- "nonTcell_clusters.xlsx"
+
+# Ensure the file exists
+if (!file.exists(file_path)) {
+  stop("File not found: ", file_path)
+}
+
+# Load the workbook
+wb <- loadWorkbook(file_path)
+
+# Get sheet names (clusters)
+sheets <- names(wb)
+
+# Check if sheets were found
+if (length(sheets) == 0) {
+  stop("No sheets found in the workbook.")
+}
+
+# Read each sheet into a list
+de_genes_list <- lapply(sheets, function(sheet) {
+  read.xlsx(wb, sheet = sheet, rowNames = TRUE)
+})
+
+# Combine all data into one dataframe, adding cluster information
+all_de_genes <- bind_rows(
+  lapply(seq_along(de_genes_list), function(i) {
+    cluster <- sheets[i]
+    de_genes_list[[i]] %>% 
+      mutate(Cluster = cluster, Gene = rownames(.)) %>%
+      select(Gene, avg_log2FC, Cluster)
+  })
+)
+
+# Define a color scale
+breaks <- seq(-2, 2, by = 0.1)
+colors <- colorRampPalette(c("blue", "white", "red"))(length(breaks))
+
+# Prepare the matrix for heatmap
+heatmap_data <- spread(all_de_genes, key = Cluster, value = avg_log2FC)
+
+# Remove genes with no values across all clusters
+heatmap_data <- heatmap_data[rowSums(is.na(heatmap_data)) < ncol(heatmap_data), ]
+
+# Convert to matrix and set row names as gene names
+heatmap_matrix <- as.matrix(heatmap_data[,-1]) # Assuming first column is Gene
+rownames(heatmap_matrix) <- heatmap_data$Gene
+
+CD4T <- pheatmap(
+  heatmap_matrix,
+  cluster_cols = TRUE,
+  cluster_rows = TRUE,
+  color = colors,
+  breaks = breaks,
+  show_colnames = TRUE,
+  show_rownames = TRUE,
+  main = "" # Remove the default title
+)
+
+# Define output file name
+output_pdf <- "./heatmap.pdf"
+
+# Save the heatmap as a PDF
+pdf(output_pdf)
+CD4T
+dev.off()
+
+
+print(paste("Heatmap saved as", output_pdf))
+```
+
+```{r pressure, echo=FALSE}
+library(readxl)
+library(ggplot2)
+library(dplyr)
+
+# Function to create a dot plot for a given data frame
+create_dot_plot <- function(df, sheet_name) {
+  # Filter the top 5 pathways with the lowest padj
+  top_pathways <- df %>%
+    arrange(padj) %>%
+    head(5)
+  
+  # Create the dot plot
+  p <- ggplot(top_pathways, aes(x = reorder(pathway, -padj), y = -log10(padj))) +
+    geom_point(aes(size = size), color = "black") +  # Removed color = padj
+    coord_flip() +
+    scale_size_continuous(range = c(3, 10), limits = c(100, 2000), breaks = seq(100, 2000, by = 500)) +  # Manually set the size scale
+    scale_y_continuous(limits = c(0, 30), breaks = seq(0, 30, by = 5)) +  # Set y-axis limits and breaks
+    labs(title = paste("Dotplot for", sheet_name),
+         x = "Pathway",
+         y = "-log10(padj)",
+         size = "Size") +
+    theme_minimal() +
+    theme(
+      panel.background = element_rect(fill = "white", color = "black"),  # Set panel background to white and add black border
+      plot.background = element_rect(fill = "white", color = NA),   # Set plot background to white
+      axis.text.y = element_blank(),   # Remove y-axis text
+      axis.title.y = element_blank(),  # Remove y-axis title
+      panel.border = element_rect(color = "black", fill = NA)  # Add a black border around the panel
+    )
+  
+  print(p)
+  
+  # Save the plot as a PDF file
+  file_name <- paste0(sheet_name, "_dotplot.pdf")
+  ggsave(file_name, plot = p, width = 8, height = 6)
+}
+
+# Load the Excel file
+file_path <- ""  # Update this with the correct file path
+sheets <- excel_sheets(file_path)
+
+# Debugging: Print the sheet names
+print(sheets)
+
+# Iterate through each sheet and create the dot plot
+for (sheet in sheets) {
+  # Debugging: Print the current sheet name
+  print(paste("Processing sheet:", sheet))
+  
+  df <- read_excel(file_path, sheet = sheet)
+  create_dot_plot(df, sheet)
+}
+
+
+```
+
+```{r pressure, echo=FALSE}
+plot(pressure)
+```
+
+```{r pressure, echo=FALSE}
+plot(pressure)
+```
+
+```{r pressure, echo=FALSE}
+plot(pressure)
+```
+
+```{r pressure, echo=FALSE}
+plot(pressure)
+```
+
+```{r pressure, echo=FALSE}
+plot(pressure)
+```
+
+
+```{r pressure, echo=FALSE}
+
+###Subcluster cluster 3 ###
+
+# Subset the Seurat object to include only cells from cluster 0
+cluster_3_cells <- subset(seurat_object, idents = 3)
+
+# Normalize the subset data
+cluster_3_cells <- NormalizeData(cluster_3_cells)
+
+# Find variable features
+# cluster_0_cells <- FindVariableFeatures(cluster_0_cells)
+
+VariableFeatures(cluster_3_cells) <- c("CD103", "ECadherin", "CD4", "HLADR", "CD161", "GRZb", "Eomes", "CD69", "GRZa", "Langerin", "CD8", "CD3", "CD31", "CD49a", "CD66b")
+
+# Scale the data
+cluster_3_cells <- ScaleData(cluster_3_cells)
+
+# Perform PCA
+cluster_3_cells <- RunPCA(cluster_3_cells)
+
+# Perform Harmony integration if necessary
+cluster_3_cells <- harmony::RunHarmony(
+  object = cluster_3_cells,
+  assay = "RNA",
+  group.by = "Metadata_ID",
+  theta = 3
+)
+
+# Perform UMAP with Harmony reduction
+cluster_3_cells <- RunUMAP(cluster_3_cells, reduction = "harmony", dims = 1:10)
+
+# Find neighbors and clusters within cluster 0 cells
+cluster_3_cells <- FindNeighbors(cluster_3_cells, reduction = "harmony", dims = 1:10)
+cluster_3_cells <- FindClusters(cluster_3_cells, resolution = 0.15)  # You can adjust the resolution parameter
+
+# Visualize the subclusters
+DimPlot(cluster_3_cells, reduction = "umap", label = TRUE) + ggtitle("Subclusters of Cluster 3")
+DoHeatmap(cluster_3_cells)
+#DimPlot(cluster_3_cells, reduction = "umap", label = TRUE, group.by = "Metadata_ID")
+#DimPlot(cluster_3_cells, reduction = "umap", group.by = "Metadata_Condition") + ggtitle("UMAP by Condition")
+
+```
+
+
+```{r pressure, echo=FALSE}
+
+# Ensure metadata columns are correctly integrated
+print(head(seurat_object[[]]))
+
+# Differential expression analysis between HIV and CTR within each cluster
+Idents(seurat_object) <- "seurat_clusters"
+
+# Ensure Metadata_Condition is present in the Seurat object
+if ("Metadata_Condition" %in% colnames(seurat_object[[]])) {
+  all_clusters <- unique(Idents(seurat_object))
+  cluster_de_genes <- list()
+
+  for (cluster in all_clusters) {
+    print(paste("Processing cluster:", cluster))
+    cluster_cells <- WhichCells(seurat_object, idents = cluster)
+    
+    hiv_cells <- intersect(cluster_cells, WhichCells(seurat_object, expression = Metadata_Condition == "HIV"))
+    ctr_cells <- intersect(cluster_cells, WhichCells(seurat_object, expression = Metadata_Condition == "CTR"))
+    
+    print(paste("Number of HIV cells in cluster", cluster, ":", length(hiv_cells)))
+    print(paste("Number of CTR cells in cluster", cluster, ":", length(ctr_cells)))
+    
+    if (length(hiv_cells) > 0 & length(ctr_cells) > 0) {
+      de_genes <- FindMarkers(seurat_object, ident.1 = hiv_cells, ident.2 = ctr_cells, test.use = "MAST")
+      cluster_de_genes[[as.character(cluster)]] <- de_genes
+    } else {
+      print(paste("Skipping cluster", cluster, "due to insufficient cells in one of the groups"))
+    }
+  }
+
+  # View and/or save the DEGs for each cluster
+  for (cluster in names(cluster_de_genes)) {
+    cat("\nCluster:", cluster, "\n")
+    print(head(cluster_de_genes[[cluster]]))
+    write.csv(cluster_de_genes[[cluster]], file = paste0("DEGs_cluster_", cluster, ".csv"), row.names = TRUE)
+  }
+} else {
+  print("Metadata_Condition is not found in the Seurat object.")
+}
+
+# Ensure Metadata_Condition is a factor
+seurat_object$Metadata_Condition <- as.factor(seurat_object$Metadata_Condition)
+
+# Identify HIV and CTR cells
+hiv_cells <- WhichCells(seurat_object, expression = Metadata_Condition == "HIV")
+ctr_cells <- WhichCells(seurat_object, expression = Metadata_Condition == "CTR")
+
+# Ensure expression_data has columns matching the Seurat object cell names
+expression_data <- as.data.frame(t(as.matrix(GetAssayData(seurat_object, slot = "data"))))
+
+# Compute the mean expression for each gene across HIV and CTR cells
+hiv_aggregated <- colMeans(expression_data[hiv_cells, ])
+ctr_aggregated <- colMeans(expression_data[ctr_cells, ])
+
+# Combine into a data frame
+aggregated_data <- data.frame(
+  Marker = colnames(expression_data),
+  HIV = hiv_aggregated,
+  CTR = ctr_aggregated
+)
+
+# Set row names to marker names
+rownames(aggregated_data) <- aggregated_data$Marker
+aggregated_data <- aggregated_data[, -1]
+
+# Scale the data for better visualization
+aggregated_data_scaled <- t(scale(t(aggregated_data)))
+
+# Generate the heatmap
+pheatmap(aggregated_data, 
+         cluster_rows = TRUE, 
+         cluster_cols = TRUE, 
+         display_numbers = FALSE, 
+         color = colorRampPalette(c("blue", "white", "red"))(100),
+         main = "Aggregated Marker Expression: HIV vs CTR")
+
+```
+
+
+
